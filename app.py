@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,17 +62,19 @@ class Repository:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self._lock = threading.Lock()
         self.init_schema()
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.conn
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
 
     def init_schema(self) -> None:
         self.conn.executescript(
@@ -117,20 +120,37 @@ class Repository:
                 created_at TEXT NOT NULL,
                 UNIQUE(case_id, revision)
             );
+            CREATE TABLE IF NOT EXISTS case_combos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                combo_no INTEGER NOT NULL,
+                product TEXT NOT NULL,
+                event_term TEXT NOT NULL,
+                serious INTEGER NOT NULL DEFAULT 0,
+                fatal INTEGER NOT NULL DEFAULT 0,
+                causality TEXT,
+                source TEXT,
+                followup_id INTEGER REFERENCES followups(id),
+                received_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(case_id, combo_no)
+            );
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES cases(id),
+                combo_id INTEGER NOT NULL REFERENCES case_combos(id),
                 country TEXT NOT NULL,
                 due_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 submitted_at TEXT,
                 submitted_by TEXT,
                 late INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(case_id, country)
+                UNIQUE(combo_id, country)
             );
             CREATE TABLE IF NOT EXISTS medical_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES cases(id),
+                combo_id INTEGER NOT NULL REFERENCES case_combos(id),
                 case_revision INTEGER NOT NULL,
                 serious INTEGER NOT NULL,
                 fatal INTEGER NOT NULL,
@@ -138,7 +158,7 @@ class Repository:
                 rationale TEXT NOT NULL,
                 reviewer TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                UNIQUE(case_id, case_revision)
+                UNIQUE(case_id, case_revision, combo_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +171,65 @@ class Repository:
             );
             """
         )
+        self._migrate()
+
+    def _columns(self, table: str) -> list[str]:
+        return [row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")]
+
+    def _migrate(self) -> None:
+        """老库升级：药品/事件词归入第一组搭配，旧报告挂到第一组搭配。"""
+        if "combo_id" not in self._columns("reports"):
+            self.conn.execute(
+                """INSERT INTO case_combos(case_id,combo_no,product,event_term,serious,fatal,causality,source,received_at,created_at)
+                   SELECT c.id,1,c.product,c.event_term,c.serious,c.fatal,c.causality,NULL,c.received_at,?
+                   FROM cases c
+                   WHERE NOT EXISTS (SELECT 1 FROM case_combos cc WHERE cc.case_id=c.id)""",
+                (iso(),),
+            )
+            self.conn.execute(
+                """CREATE TABLE reports_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL REFERENCES cases(id),
+                    combo_id INTEGER NOT NULL REFERENCES case_combos(id),
+                    country TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    submitted_at TEXT,
+                    submitted_by TEXT,
+                    late INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(combo_id, country)
+                )"""
+            )
+            self.conn.execute(
+                """INSERT INTO reports_new(id,case_id,combo_id,country,due_at,status,submitted_at,submitted_by,late)
+                   SELECT r.id,r.case_id,cc.id,r.country,r.due_at,r.status,r.submitted_at,r.submitted_by,r.late
+                   FROM reports r JOIN case_combos cc ON cc.case_id=r.case_id AND cc.combo_no=1"""
+            )
+            self.conn.execute("DROP TABLE reports")
+            self.conn.execute("ALTER TABLE reports_new RENAME TO reports")
+        if "combo_id" not in self._columns("medical_reviews"):
+            self.conn.execute(
+                """CREATE TABLE medical_reviews_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL REFERENCES cases(id),
+                    combo_id INTEGER NOT NULL REFERENCES case_combos(id),
+                    case_revision INTEGER NOT NULL,
+                    serious INTEGER NOT NULL,
+                    fatal INTEGER NOT NULL,
+                    causality TEXT NOT NULL,
+                    rationale TEXT NOT NULL,
+                    reviewer TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(case_id, case_revision, combo_id)
+                )"""
+            )
+            self.conn.execute(
+                """INSERT INTO medical_reviews_new(id,case_id,combo_id,case_revision,serious,fatal,causality,rationale,reviewer,created_at)
+                   SELECT m.id,m.case_id,cc.id,m.case_revision,m.serious,m.fatal,m.causality,m.rationale,m.reviewer,m.created_at
+                   FROM medical_reviews m JOIN case_combos cc ON cc.case_id=m.case_id AND cc.combo_no=1"""
+            )
+            self.conn.execute("DROP TABLE medical_reviews")
+            self.conn.execute("ALTER TABLE medical_reviews_new RENAME TO medical_reviews")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -189,6 +268,52 @@ class PharmacovigilanceService:
             raise ApiError(404, "case_not_found", "案例不存在")
         return row
 
+    def _combo(self, conn: sqlite3.Connection, case_id: int, combo_id: int | None) -> sqlite3.Row:
+        if combo_id is None:
+            row = conn.execute(
+                "SELECT * FROM case_combos WHERE case_id=? ORDER BY combo_no LIMIT 1", (case_id,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM case_combos WHERE id=? AND case_id=?", (combo_id, case_id)
+            ).fetchone()
+        if not row:
+            raise ApiError(404, "combo_not_found", "搭配组不存在")
+        return row
+
+    @staticmethod
+    def _parse_extra_combos(body: dict[str, Any]) -> list[tuple[str, str]]:
+        raw = body.get("combos")
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ApiError(400, "invalid_combos", "combos 必须是数组")
+        combos: list[tuple[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ApiError(400, "invalid_combos", "combos 每项必须是对象")
+            product = str(item.get("product", "")).strip()
+            event_term = str(item.get("event_term", "")).strip()
+            if not product or not event_term:
+                raise ApiError(400, "missing_fields", "combos 每项必须含 product 和 event_term")
+            combos.append((product, event_term))
+        return combos
+
+    def _recompute_case_aggregates(self, conn: sqlite3.Connection, case_id: int) -> None:
+        """案例整体取最重一档：严重/死亡为各组搭配之或，期限按最重一档重算。"""
+        case = self._case(conn, case_id)
+        rows = conn.execute("SELECT serious,fatal FROM case_combos WHERE case_id=?", (case_id,)).fetchall()
+        serious = any(row["serious"] for row in rows)
+        fatal = any(row["fatal"] for row in rows)
+        primary = conn.execute(
+            "SELECT causality FROM case_combos WHERE case_id=? ORDER BY combo_no LIMIT 1", (case_id,)
+        ).fetchone()
+        due = report_deadline(parse_time(case["received_at"]), serious, fatal)
+        conn.execute(
+            "UPDATE cases SET serious=?,fatal=?,causality=?,report_due_at=? WHERE id=?",
+            (int(serious), int(fatal), primary["causality"] if primary else None, iso(due), case_id),
+        )
+
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
         missing = [key for key in required if not str(body.get(key, "")).strip()]
@@ -198,6 +323,7 @@ class PharmacovigilanceService:
             raise ApiError(403, "region_forbidden", "只能录入本区域案例")
         if role == "medical_reviewer" and body["region"] not in {"", region}:
             raise ApiError(403, "reviewer_region_forbidden", "医学审核员不能代表区域录入案例")
+        extra = self._parse_extra_combos(body)
         received = parse_time(body.get("received_at"), utcnow())
         serious = bool(body.get("serious", False))
         fatal = bool(body.get("fatal", False))
@@ -224,10 +350,23 @@ class PharmacovigilanceService:
                 raise ApiError(409, "case_number_conflict", "案例编号已存在") from exc
             case_id = cursor.lastrowid
             conn.execute(
+                """INSERT INTO case_combos(case_id,combo_no,product,event_term,serious,fatal,causality,source,received_at,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (case_id, 1, body["product"], body["event_term"], int(serious), int(fatal),
+                 body.get("causality"), body["source"], iso(received), now),
+            )
+            for offset, (product, event_term) in enumerate(extra, start=2):
+                conn.execute(
+                    """INSERT INTO case_combos(case_id,combo_no,product,event_term,serious,fatal,source,received_at,created_at)
+                       VALUES(?,?,?,?,?,0,0,?,?,?)""",
+                    (case_id, offset, product, event_term, body["source"], iso(received), now),
+                )
+            conn.execute(
                 "INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
                 (case_id, body["source"], body["dedupe_key"], json.dumps(body, ensure_ascii=False, sort_keys=True), iso(received), actor, now),
             )
-            Repository.audit(conn, case_id, actor, role, "case_created", {"case_no": case_no, "source": body["source"]})
+            Repository.audit(conn, case_id, actor, role, "case_created",
+                            {"case_no": case_no, "source": body["source"], "extra_combos": len(extra)})
             case = self._case(conn, case_id)
             return {"deduplicated": False, "case": dict(case)}
 
@@ -238,6 +377,7 @@ class PharmacovigilanceService:
         conn = self.repo.conn
         return {
             "case": dict(case),
+            "combos": [dict(r) for r in conn.execute("SELECT * FROM case_combos WHERE case_id=? ORDER BY combo_no", (case_id,))],
             "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
@@ -265,6 +405,7 @@ class PharmacovigilanceService:
         expected = body.get("expected_revision")
         if not isinstance(expected, int):
             raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        extra = self._parse_extra_combos(body)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region) or role in {"medical_reviewer"}:
@@ -275,17 +416,66 @@ class PharmacovigilanceService:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
             received = parse_time(body.get("received_at"), utcnow())
-            due = report_deadline(received, bool(case["serious"]), bool(case["fatal"]))
             conn.execute(
                 "INSERT INTO followups(case_id,content,source,received_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
                 (case_id, content, source, iso(received), revision, actor, iso()),
             )
+            followup_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if extra:
+                max_no = conn.execute(
+                    "SELECT COALESCE(MAX(combo_no),0) FROM case_combos WHERE case_id=?", (case_id,)
+                ).fetchone()[0]
+                for offset, (product, event_term) in enumerate(extra, start=1):
+                    conn.execute(
+                        """INSERT INTO case_combos(case_id,combo_no,product,event_term,serious,fatal,source,followup_id,received_at,created_at)
+                           VALUES(?,?,?,?,0,0,?,?,?,?)""",
+                        (case_id, max_no + offset, product, event_term, source, followup_id, iso(received), iso()),
+                    )
             conn.execute(
-                "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
-                (revision, iso(received), iso(due), iso(), case_id),
+                "UPDATE cases SET revision=?,received_at=?,updated_at=? WHERE id=?",
+                (revision, iso(received), iso(), case_id),
             )
-            Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
+            self._recompute_case_aggregates(conn, case_id)
+            Repository.audit(conn, case_id, actor, role, "followup_added",
+                            {"revision": revision, "source": source, "added_combos": len(extra)})
             return {"case": dict(self._case(conn, case_id)), "revision": revision}
+
+    @staticmethod
+    def _parse_review_targets(body: dict[str, Any]) -> list[tuple[int | None, bool, bool, str]]:
+        rationale = str(body.get("rationale", "")).strip()
+        if not rationale:
+            raise ApiError(400, "invalid_review", "rationale 必填")
+        raw = body.get("combos")
+        if raw is not None:
+            if not isinstance(raw, list) or not raw:
+                raise ApiError(400, "invalid_review", "combos 必须是非空列表")
+            targets: list[tuple[int | None, bool, bool, str]] = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    raise ApiError(400, "invalid_review", "combos 每项必须是对象")
+                combo_id = item.get("combo_id")
+                if not isinstance(combo_id, int):
+                    raise ApiError(400, "invalid_review", "combo_id 必须是整数")
+                serious = item.get("serious")
+                fatal = item.get("fatal")
+                causality = str(item.get("causality", "")).strip()
+                if not isinstance(serious, bool) or not isinstance(fatal, bool) or not causality:
+                    raise ApiError(400, "invalid_review", "每项 serious/fatal 必须是布尔值，causality 必填")
+                if fatal and not serious:
+                    raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
+                targets.append((combo_id, serious, fatal, causality))
+            return targets
+        serious = body.get("serious")
+        fatal = body.get("fatal")
+        causality = str(body.get("causality", "")).strip()
+        if not isinstance(serious, bool) or not isinstance(fatal, bool) or not causality:
+            raise ApiError(400, "invalid_review", "serious/fatal 必须是布尔值，causality 和 rationale 必填")
+        if fatal and not serious:
+            raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
+        combo_id = body.get("combo_id")
+        if combo_id is not None and not isinstance(combo_id, int):
+            raise ApiError(400, "invalid_review", "combo_id 必须是整数")
+        return [(combo_id, serious, fatal, causality)]
 
     def medical_review(self, case_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "medical_reviewer":
@@ -293,33 +483,41 @@ class PharmacovigilanceService:
         expected = body.get("expected_revision")
         if not isinstance(expected, int):
             raise ApiError(400, "revision_required", "expected_revision 必须是整数")
-        serious = body.get("serious")
-        fatal = body.get("fatal")
-        causality = str(body.get("causality", "")).strip()
-        rationale = str(body.get("rationale", "")).strip()
-        if not isinstance(serious, bool) or not isinstance(fatal, bool) or not causality or not rationale:
-            raise ApiError(400, "invalid_review", "serious/fatal 必须是布尔值，causality 和 rationale 必填")
-        if fatal and not serious:
-            raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
+        targets = self._parse_review_targets(body)
         received = parse_time(body.get("received_at"))
-        due = report_deadline(received, serious, fatal)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if case["status"] == "merged":
                 raise ApiError(409, "case_merged", "已合并案例不能审核")
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例版本已变化")
+            resolved: list[tuple[int, bool, bool, str]] = []
+            for combo_id, serious, fatal, causality in targets:
+                combo = self._combo(conn, case_id, combo_id)
+                resolved.append((combo["id"], serious, fatal, causality))
             revision = expected + 1
-            conn.execute(
-                """UPDATE cases SET serious=?,fatal=?,causality=?,report_due_at=?,revision=?,updated_at=? WHERE id=?""",
-                (int(serious), int(fatal), causality, iso(due), revision, iso(), case_id),
-            )
-            conn.execute(
-                """INSERT INTO medical_reviews(case_id,case_revision,serious,fatal,causality,rationale,reviewer,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
-            )
-            Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
+            for combo_id, serious, fatal, causality in resolved:
+                conn.execute(
+                    "UPDATE case_combos SET serious=?,fatal=?,causality=? WHERE id=?",
+                    (int(serious), int(fatal), causality, combo_id),
+                )
+                conn.execute(
+                    """INSERT INTO medical_reviews(case_id,combo_id,case_revision,serious,fatal,causality,rationale,reviewer,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (case_id, combo_id, expected, int(serious), int(fatal), causality,
+                     str(body.get("rationale", "")).strip(), actor, iso()),
+                )
+                due = report_deadline(parse_time(case["received_at"]), serious, fatal)
+                conn.execute(
+                    "UPDATE reports SET due_at=? WHERE combo_id=? AND status!='submitted'",
+                    (iso(due), combo_id),
+                )
+            self._recompute_case_aggregates(conn, case_id)
+            conn.execute("UPDATE cases SET revision=?,updated_at=? WHERE id=?", (revision, iso(), case_id))
+            Repository.audit(conn, case_id, actor, role, "medical_reviewed",
+                            {"from_revision": expected, "combos": [
+                                {"combo_id": cid, "serious": s, "fatal": f} for cid, s, f, _ in resolved
+                            ]})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
 
     def create_report(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -328,16 +526,26 @@ class PharmacovigilanceService:
         country = str(body.get("country", "")).strip().upper()
         if not country:
             raise ApiError(400, "country_required", "country 必填")
+        combo_id = body.get("combo_id")
+        if combo_id is not None and not isinstance(combo_id, int):
+            raise ApiError(400, "invalid_combo", "combo_id 必须是整数")
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
-            due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
-            try:
-                cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
-            except sqlite3.IntegrityError as exc:
-                raise ApiError(409, "report_exists", "该国家报告已经存在") from exc
-            Repository.audit(conn, case_id, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country})
+            combo = self._combo(conn, case_id, combo_id)
+            due = report_deadline(parse_time(case["received_at"]), bool(combo["serious"]), bool(combo["fatal"]))
+            existing = conn.execute(
+                "SELECT * FROM reports WHERE combo_id=? AND country=?", (combo["id"], country)
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            cur = conn.execute(
+                "INSERT INTO reports(case_id,combo_id,country,due_at,status) VALUES(?,?,?,?,?)",
+                (case_id, combo["id"], country, iso(due), "pending"),
+            )
+            Repository.audit(conn, case_id, actor, role, "report_created",
+                            {"report_id": cur.lastrowid, "combo_id": combo["id"], "country": country})
             return dict(conn.execute("SELECT * FROM reports WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def submit_report(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
